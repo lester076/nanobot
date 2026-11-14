@@ -115,9 +115,7 @@ async def test_send_exception_propagates_for_manager_retry() -> None:
         channel, "_send_text_only", new_callable=AsyncMock, side_effect=RuntimeError("boom")
     ) as send_text:
         with pytest.raises(RuntimeError, match="boom"):
-            await channel.send(
-                OutboundMessage(channel="qq", chat_id="user1", content="hello")
-            )
+            await channel.send(OutboundMessage(channel="qq", chat_id="user1", content="hello"))
     send_text.assert_awaited_once()
 
 
@@ -133,7 +131,9 @@ async def test_send_media_then_text() -> None:
         tmp = f.name
 
     try:
-        with patch.object(channel, "_post_base64file", new_callable=AsyncMock, return_value={"file_info": "1"}) as mock_upload:
+        with patch.object(
+            channel, "_post_base64file", new_callable=AsyncMock, return_value={"file_info": "1"}
+        ) as mock_upload:
             await channel.send(
                 OutboundMessage(
                     channel="qq",
@@ -150,6 +150,7 @@ async def test_send_media_then_text() -> None:
         assert text_calls[-1]["content"] == "text after image"
     finally:
         import os
+
         os.unlink(tmp)
 
 
@@ -169,7 +170,9 @@ async def test_send_media_failure_falls_back_to_text() -> None:
             )
         )
 
-    failure_calls = [c for c in channel._client.api.c2c_calls if "Attachment send failed" in c.get("content", "")]
+    failure_calls = [
+        c for c in channel._client.api.c2c_calls if "Attachment send failed" in c.get("content", "")
+    ]
     assert len(failure_calls) == 1
     assert "bad.png" in failure_calls[0]["content"]
 
@@ -284,6 +287,7 @@ async def test_on_message_with_attachments() -> None:
         assert msg.media[0] == saved_path
     finally:
         import os
+
         os.unlink(saved_path)
 
 
@@ -331,11 +335,13 @@ async def test_post_base64file_includes_file_name_for_files() -> None:
 @pytest.mark.asyncio
 async def test_post_base64file_filters_response_to_file_info() -> None:
     channel = QQChannel(QQConfig(app_id="app", secret="secret"), MessageBus())
-    channel._client = _FakeClient(http_return={
-        "file_info": "fi_123",
-        "file_uuid": "uuid_xxx",
-        "ttl": 3600,
-    })
+    channel._client = _FakeClient(
+        http_return={
+            "file_info": "fi_123",
+            "file_uuid": "uuid_xxx",
+            "ttl": 3600,
+        }
+    )
 
     result = await channel._post_base64file(
         chat_id="user1",
@@ -348,3 +354,56 @@ async def test_post_base64file_filters_response_to_file_info() -> None:
     assert result == {"file_info": "fi_123"}
     assert "file_uuid" not in result
     assert "ttl" not in result
+
+
+@pytest.mark.asyncio
+async def test_send_media_retries_once_after_empty_response() -> None:
+    """A botpy client timeout returns None instead of raising (#6652); the
+    upload produced no file_info, so _send_media retries the same upload once
+    and delivers when the retry succeeds."""
+    channel = QQChannel(QQConfig(app_id="app", secret="secret"), MessageBus())
+    channel._client = _FakeClient(http_return={"file_info": "fi_ok"})
+
+    upload = AsyncMock(side_effect=[None, {"file_info": "fi_ok"}])
+    with (
+        patch.object(channel, "_post_base64file", upload),
+        patch.object(
+            channel, "_read_media_bytes", new_callable=AsyncMock, return_value=(b"pdf", "doc.pdf")
+        ),
+    ):
+        ok = await channel._send_media("user1", "file:///tmp/doc.pdf", msg_id=None, is_group=False)
+
+    assert ok is True
+    assert upload.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_media_fails_after_retry_still_empty() -> None:
+    """Both attempts empty -> False, send() falls back to the failure text."""
+    channel = QQChannel(QQConfig(app_id="app", secret="secret"), MessageBus())
+    channel._client = _FakeClient(http_return={})
+
+    upload = AsyncMock(return_value=None)
+    with (
+        patch.object(channel, "_post_base64file", upload),
+        patch.object(
+            channel, "_read_media_bytes", new_callable=AsyncMock, return_value=(b"pdf", "doc.pdf")
+        ),
+    ):
+        ok = await channel._send_media("user1", "file:///tmp/doc.pdf", msg_id=None, is_group=False)
+
+    assert ok is False
+    assert upload.call_count == 2
+
+
+def test_make_bot_class_passes_configured_api_timeout() -> None:
+    """botpy's 5 s default cannot carry a multi-MB base64 upload (#6652);
+    the client must be built with the configured whole-request budget."""
+    import inspect
+
+    from nanobot.channels.qq.runtime import _make_bot_class
+
+    channel = QQChannel(QQConfig(app_id="app", secret="secret", api_timeout=45), MessageBus())
+    bot_cls = _make_bot_class(channel)
+    source = inspect.getsource(bot_cls.__init__)
+    assert "timeout=channel.config.api_timeout" in source

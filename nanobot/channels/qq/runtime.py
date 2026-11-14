@@ -120,10 +120,14 @@ def _make_bot_class(channel: QQChannel) -> type[Any]:
 
     class _Bot(botpy_sdk.Client):
         def __init__(self):
-            # Disable botpy's file log — nanobot uses loguru; default "botpy.log" fails on read-only fs
+            # Disable botpy's file log — nanobot uses loguru; default "botpy.log" fails on read-only fs.
+            # botpy applies timeout as aiohttp.ClientTimeout(total=timeout) on every
+            # BotHttp request, so the 5 s default cannot carry a multi-MB base64
+            # media upload (#6652).
             super().__init__(  # pyright: ignore[reportUnknownMemberType]
                 intents=intents,
                 ext_handlers=False,
+                timeout=channel.config.api_timeout,
             )
             self._ws_backoff: dict[int, int] = {}
             self._ws_retry_at: dict[int, float] = {}
@@ -295,6 +299,11 @@ class QQConfig(Base):
     download_chunk_size: int = 1024 * 256
     download_max_bytes: int = 1024 * 1024 * 200
 
+    # Whole-request budget for every botpy HTTP call (aiohttp.ClientTimeout(total=...)).
+    # botpy's 5 s default kills multi-MB base64 media uploads from typical hosts
+    # before the server answers (#6652). One knob covers media and text sends.
+    api_timeout: int = 30
+
     # QQ's C2C/group message API has no edit or recall endpoint, so automatic
     # notices would land as separate permanent messages (#5784). Unset inherits
     # the global policy (off by default); explicit legacy true/false still override it.
@@ -330,7 +339,6 @@ class QQChannel(BaseChannel):
         _install_qq_payload_capture()
 
         self._media_root: Path = self._init_media_root()
-
 
     def _init_media_root(self) -> Path:
         if self.config.media_dir:
@@ -387,9 +395,7 @@ class QQChannel(BaseChannel):
                 backoff = 5
             except Exception as e:
                 if _is_network_error(e):
-                    self.logger.warning(
-                        "QQ bot network error (retry in {}s): {}", backoff, e
-                    )
+                    self.logger.warning("QQ bot network error (retry in {}s): {}", backoff, e)
                 else:
                     self.logger.warning("bot error: {}", e)
             if self._running:
@@ -412,12 +418,10 @@ class QQChannel(BaseChannel):
 
         self.logger.info("bot stopped")
 
-
     async def send(self, msg: OutboundMessage) -> None:
         """Send attachments first, then text."""
-        if (
-            isinstance(msg.event, ContextCompactionEvent)
-            and not (msg.event.notify or self.show_compaction_notices)
+        if isinstance(msg.event, ContextCompactionEvent) and not (
+            msg.event.notify or self.show_compaction_notices
         ):
             return
 
@@ -517,7 +521,23 @@ class QQChannel(BaseChannel):
                 srv_send_msg=False,
             )
             if not media_obj:
-                self.logger.error("media upload failed: empty response")
+                # A botpy client timeout logs its own warning and returns None
+                # instead of raising, so this is the one retryable path (#6652):
+                # the upload produced no file_info, resubmitting is safe.
+                self.logger.warning(
+                    "media upload returned no file_info, retrying once filename={}",
+                    filename,
+                )
+                media_obj = await self._post_base64file(
+                    chat_id=chat_id,
+                    is_group=is_group,
+                    file_type=file_type,
+                    file_data=file_data_b64,
+                    file_name=filename,
+                    srv_send_msg=False,
+                )
+            if not media_obj:
+                self.logger.error("media upload failed: empty response after retry")
                 return False
 
             self._msg_seq += 1
@@ -576,7 +596,9 @@ class QQChannel(BaseChannel):
 
         ok, err = validate_url_target(media_ref)
         if not ok:
-            self.logger.warning("outbound media URL validation failed url={} err={}", media_ref, err)
+            self.logger.warning(
+                "outbound media URL validation failed url={} err={}", media_ref, err
+            )
             return None, None
 
         if not self._http:
@@ -643,7 +665,6 @@ class QQChannel(BaseChannel):
             result_data = cast(dict[str, Any], result)
             return {"file_info": result_data["file_info"]}
         return cast(dict[str, Any], result)
-
 
     async def _on_message(self, data: object, is_group: bool = False) -> None:
         try:
