@@ -2535,6 +2535,9 @@ def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
     assert pat.fullmatch("/history")
     assert pat.fullmatch("/history 5")
     assert pat.fullmatch("/goal ship the feature")
+    assert pat.fullmatch("/cancel_goal")
+    assert pat.fullmatch("/cancel_goal@nanobot_bot")
+    assert any(command.command == "cancel_goal" for command in TelegramChannel.BOT_COMMANDS)
     assert pat.fullmatch("/trigger")
     assert pat.fullmatch("/trigger PR review")
     assert pat.fullmatch("/pairing list")
@@ -2580,6 +2583,7 @@ async def test_on_help_includes_restart_command() -> None:
     assert "/evaluator_prompt" in help_text
     assert "/compact" in help_text
     assert "/goal" in help_text
+    assert "/cancel_goal" in help_text
     assert "/trigger" in help_text
     assert "/pairing" in help_text
     assert "/model" in help_text
